@@ -44,10 +44,19 @@ mkdir -p "$RESULT_DIR"
 
 log()  { echo "[run_baseline] $*"; }
 
-# ===== 1. 预检 =====
-if mx-smi 2>/dev/null | grep -q "No available devices"; then
-    log "❌ GPU 未启动（mx-smi 无设备）。请先启动 GPU 再运行。"; exit 1
+# ===== 0. 平台探测（沐曦 C500 / 天数 BI-V150 双平台自适应）=====
+PLATFORM="unknown"
+if command -v mx-smi >/dev/null 2>&1 && ! mx-smi 2>/dev/null | grep -q "No available devices"; then
+    PLATFORM="metax"
+elif command -v ixsmi >/dev/null 2>&1 && ixsmi 2>/dev/null | grep -q "BI-V150"; then
+    PLATFORM="iluvatar"
 fi
+if [[ "$PLATFORM" == "unknown" ]]; then
+    log "❌ 未检测到可用 GPU（mx-smi/ixsmi 均无设备）。请先启动 GPU 再运行。"; exit 1
+fi
+log "检测到平台: $PLATFORM （metax=沐曦C500 / iluvatar=天数BI-V150）"
+
+# ===== 1. 预检 =====
 [[ -d "$MODEL_PATH" ]] || { log "❌ 模型不存在: $MODEL_PATH"; exit 1; }
 log "预检通过。结果目录: $RESULT_DIR"
 
@@ -60,9 +69,15 @@ for i in $(seq 1 20); do
 done
 pgrep -f "vllm serve" >/dev/null && { log "❌ 旧 vllm serve 未退出，请手动处理"; exit 1; }
 
-log "启动 vllm serve（官方参数）..."
+log "启动 vllm serve（官方参数，按平台附加天数 cudagraph 参数）..."
+# 天数 BI-V150 官方基线要求 --compilation-config FULL_DECODE_ONLY（信息文档 §4.1），沐曦无需此参数
+EXTRA_FLAGS=()
+if [[ "$PLATFORM" == "iluvatar" ]]; then
+    EXTRA_FLAGS+=(--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}')
+fi
 VLLM_PLUGINS=fl nohup vllm serve "$MODEL_PATH" \
   --port "$PORT" \
+  "${EXTRA_FLAGS[@]}" \
   --served-model-name "$SERVED_NAME" \
   --gpu-memory-utilization 0.85 \
   --max-model-len 131072 \
