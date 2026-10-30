@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# vLLM / 编译产物
+*.so
+*.o
+*.a
+vllm_fl/*.so
+triton_cache/
+.cncli*
+
+# 评测与基准产物（CSV 统一存 results/，工作目录杂产物不进库）
+output/
+reports/
+*.log
+
+# 环境与编辑器
+.env
+.venv/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+.ipynb_checkpoints/
+
+# 大文件（模型/数据集永不进库）
+*.safetensors
+*.bin
+*.pth
+*.onnx
