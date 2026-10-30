@@ -1,0 +1,8 @@
+   105 
+ 96.2%   
+minicpm  MATH-500     105  105.18 s   
+           
+           31.21 tok/s        78       3283 
+2026-10-31 00:11:30 - evalscope - 
+[32mINFO
+[0m: Finished evaluation for minicpm on ['math_500']
