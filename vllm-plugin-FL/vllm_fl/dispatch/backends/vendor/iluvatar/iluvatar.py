@@ -235,6 +235,93 @@ def patch_sampler_compile_for_iluvatar() -> None:
 patch_sampler_compile_for_iluvatar()
 
 
+def patch_unified_attention_launch_for_iluvatar() -> None:
+    """Tune launch parameters of vllm's unified attention kernel for Iluvatar.
+
+    On BI-V150 (16 SMs), the 3D decode-split launch path of
+    ``kernel_unified_attention`` (grid = (q_blocks, num_kv_heads,
+    num_par_softmax_segments), BLOCK_M=16 / TILE_SIZE=16) is bottlenecked by
+    launch-level warp/stage overheads, not by parallelism: the default launch
+    (Triton auto: 4 warps / 3 stages) reaches only ~150 GB/s of the ~350 GB/s
+    achievable read bandwidth. Micro-benchmarks on MiniCPM5-2B decode shapes
+    (bs=64, kv=4600 and bs=30, kv=17000; head 128, GQA 16Q/2KV, bf16,
+    block=16, segments=16) show num_warps=1 + num_stages=1 gives 1.6-1.8x
+    kernel speedup (150 -> 250-300 GB/s) with bit-identical output.
+
+    Only the 3D decode-split launch (len(grid) == 3) is tuned; the 2D
+    prefill path keeps upstream defaults. Kernel math is untouched (same
+    kernel, same constexprs) -- this is a launch-config tuning for Iluvatar
+    hardware, not an operator swap.
+
+    Env switches (set to 0 to restore vllm upstream defaults):
+      VLLM_FL_ATTN_DECODE_NUM_WARPS  (default 1)
+      VLLM_FL_ATTN_DECODE_NUM_STAGES (default 1)
+    """
+    try:
+        import os
+
+        import vllm.v1.attention.ops.triton_unified_attention as _tua
+    except Exception as e:
+        logger.warning(
+            "patch_unified_attention_launch_for_iluvatar: triton_unified_attention not found: %s", e
+        )
+        return
+
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, default))
+        except ValueError:
+            return default
+
+    num_warps = _env_int("VLLM_FL_ATTN_DECODE_NUM_WARPS", 1)
+    num_stages = _env_int("VLLM_FL_ATTN_DECODE_NUM_STAGES", 1)
+    if num_warps <= 0 and num_stages <= 0:
+        return  # disabled: keep upstream defaults
+
+    jit_fn = getattr(_tua.kernel_unified_attention, "_fl_iluvatar_orig", None)
+    if jit_fn is not None:
+        return  # already patched (idempotent)
+    jit_fn = _tua.kernel_unified_attention
+
+    class _DecodeLaunchProxy:
+        """Intercept ``kernel[grid](...)``; inject warps/stages for 3D decode grid."""
+
+        __slots__ = ("_jit", "_fl_iluvatar_orig")
+
+        def __init__(self, jit):
+            self._jit = jit
+
+        def __getitem__(self, grid):
+            sub = self._jit[grid]
+            if len(grid) != 3:
+                return sub  # 2D prefill launch: upstream defaults
+
+            def _launch(*args, **kwargs):
+                if num_warps > 0:
+                    kwargs.setdefault("num_warps", num_warps)
+                if num_stages > 0:
+                    kwargs.setdefault("num_stages", num_stages)
+                return self._jit.run(grid=grid, warmup=False, *args, **kwargs)
+
+            return _launch
+
+        def __getattr__(self, name):
+            return getattr(self._jit, name)
+
+    proxy = _DecodeLaunchProxy(jit_fn)
+    proxy._fl_iluvatar_orig = jit_fn  # type: ignore[attr-defined]
+    _tua.kernel_unified_attention = proxy
+    logger.info(
+        "patch_unified_attention_launch_for_iluvatar: decode 3D launch tuned to "
+        "num_warps=%d num_stages=%d (env VLLM_FL_ATTN_DECODE_NUM_WARPS/STAGES=0 to disable)",
+        num_warps,
+        num_stages,
+    )
+
+
+patch_unified_attention_launch_for_iluvatar()
+
+
 def patch_torch_inductor_for_iluvatar() -> None:
     """Patch torch._inductor GPUTarget to use the correct triton backend name.
 
