@@ -256,6 +256,13 @@ def patch_unified_attention_launch_for_iluvatar() -> None:
     Env switches (set to 0 to restore vllm upstream defaults):
       VLLM_FL_ATTN_DECODE_NUM_WARPS  (default 1)
       VLLM_FL_ATTN_DECODE_NUM_STAGES (default 1)
+      VLLM_FL_ATTN_PREFILL_NUM_WARPS  (default 2)
+      VLLM_FL_ATTN_PREFILL_NUM_STAGES (default 1)
+
+    Prefill (2D launch): micro-bench on chunked-prefill shapes (8seq x 1024q
+    x kv4096, bf16, GQA 16Q/2KV, block=16) shows w2/s1 = 46.5ms vs default
+    (w4/s3) 69.9ms per call (1.50x); num_stages=1 dominates the win across
+    warp counts.
     """
     try:
         import os
@@ -275,7 +282,14 @@ def patch_unified_attention_launch_for_iluvatar() -> None:
 
     num_warps = _env_int("VLLM_FL_ATTN_DECODE_NUM_WARPS", 1)
     num_stages = _env_int("VLLM_FL_ATTN_DECODE_NUM_STAGES", 1)
-    if num_warps <= 0 and num_stages <= 0:
+    prefill_warps = _env_int("VLLM_FL_ATTN_PREFILL_NUM_WARPS", 2)
+    prefill_stages = _env_int("VLLM_FL_ATTN_PREFILL_NUM_STAGES", 1)
+    if (
+        num_warps <= 0
+        and num_stages <= 0
+        and prefill_warps <= 0
+        and prefill_stages <= 0
+    ):
         return  # disabled: keep upstream defaults
 
     jit_fn = getattr(_tua.kernel_unified_attention, "_fl_iluvatar_orig", None)
@@ -293,14 +307,20 @@ def patch_unified_attention_launch_for_iluvatar() -> None:
 
         def __getitem__(self, grid):
             sub = self._jit[grid]
-            if len(grid) != 3:
-                return sub  # 2D prefill launch: upstream defaults
+            if len(grid) == 3:
+                w, s = num_warps, num_stages
+            elif len(grid) == 2:
+                w, s = prefill_warps, prefill_stages
+            else:
+                return sub
+            if w <= 0 and s <= 0:
+                return sub
 
             def _launch(*args, **kwargs):
-                if num_warps > 0:
-                    kwargs.setdefault("num_warps", num_warps)
-                if num_stages > 0:
-                    kwargs.setdefault("num_stages", num_stages)
+                if w > 0:
+                    kwargs.setdefault("num_warps", w)
+                if s > 0:
+                    kwargs.setdefault("num_stages", s)
                 return self._jit.run(grid=grid, warmup=False, *args, **kwargs)
 
             return _launch
@@ -312,10 +332,13 @@ def patch_unified_attention_launch_for_iluvatar() -> None:
     proxy._fl_iluvatar_orig = jit_fn  # type: ignore[attr-defined]
     _tua.kernel_unified_attention = proxy
     logger.info(
-        "patch_unified_attention_launch_for_iluvatar: decode 3D launch tuned to "
-        "num_warps=%d num_stages=%d (env VLLM_FL_ATTN_DECODE_NUM_WARPS/STAGES=0 to disable)",
+        "patch_unified_attention_launch_for_iluvatar: decode 3D launch -> "
+        "num_warps=%d num_stages=%d, prefill 2D launch -> num_warps=%d num_stages=%d "
+        "(env VLLM_FL_ATTN_{DECODE,PREFILL}_NUM_{WARPS,STAGES}=0 to disable)",
         num_warps,
         num_stages,
+        prefill_warps,
+        prefill_stages,
     )
 
 
