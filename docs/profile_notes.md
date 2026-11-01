@@ -39,3 +39,23 @@ eager step 时长 334.8ms（正式跑 graph 模式 156ms，差值为图收益）
 1. `feat/d3a-splitkv`：metax `triton_decode_attention.py` 适配 iluvatar（GQA 16Q/2KV、head_dim 128、bf16、block 16）→ vendor/iluvatar backend 类 → iluvatar.yaml 路由 → 单测比对（vs vllm unified kernel）→ tier 验证
 2. 注意图捕获约束：FULL_DECODE_ONLY 下 decode 走全图，新 kernel 必须可捕获（静态 shape、无 CPU 分支、num_splits 定长或按档位）
 3. 预期：attention 2.0ms→0.6-1.0ms/层调用（16 SM 欠并行 → split 后 CTA×4-8），4K step 84→30-50ms attention
+
+---
+
+## 优化后复测（2026-11-01 晚，D3a+D3c 后，eager 4K 稳态 90 steps）
+
+| 类别 | 占比 | 对比优化前 | 状态 |
+|---|---|---|---|
+| attention | 69.5%（kernel 均次 1124.7µs，混合 1.78×） | 80.2% | 仍主导 |
+| GEMM | 18.3%（74.1µs/次） | 11.8% | **已达带宽理论下限**（12.5ms/step ≈ 4.5GB权重 ÷ 352GB/s），无空间 |
+| sampler | 6.1% | 3.9% | 负结果已存档（图外时间与调度重叠） |
+
+### launch 级扫描空间已穷尽（全部组内交替 A/B 验证）
+- tile：16 最优（32 在 16K 慢 0.78×；8 违反 triton dot K≥16 约束不可编译）
+- warps/stages：decode w1/s1、prefill w2/s1（已上线）
+- segments：16 已最优（4K/16K 均确认）
+- BLOCK_M：非单调反例（bs30 1.21× / bs24 0.94× / 4K 0.93×），动态 batch 下不可靠，放弃
+- **结论：attention kernel 当前 267GB/s（76% 带宽利用率），进一步提升需 kernel 级开发（页表访存模式/L2 布局），预期收益 <10%、工作量 2-3 天**
+
+### 方法论追加
+- 微基准组间漂移可达 73%（GPU 时钟/缓存状态）——**所有对比必须组内交替 A/B（≥3 轮）**，单组对照会出 1.36× 假加速（本次 tile32 教训）
