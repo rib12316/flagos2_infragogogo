@@ -345,6 +345,63 @@ def patch_unified_attention_launch_for_iluvatar() -> None:
 patch_unified_attention_launch_for_iluvatar()
 
 
+def patch_sampler_parallelism_for_iluvatar() -> None:
+    """Scale up top-k/top-p sampler grid parallelism for Iluvatar.
+
+    vllm's ``apply_top_k_top_p_triton`` launches
+    ``NUM_PROGRAMS = min(num_compute_units(), batch_size)`` programs and each
+    program serially walks rows ``tl.range(pid, BATCH_SIZE, num_programs)``.
+    On BI-V150 (16 compute units) that is only 16 CTAs for a typical
+    decode batch of 64 rows x 130560 vocab -> the sampler costs ~4 ms/step
+    (largest off-graph item in the decode profile).
+
+    This patch overrides only the *module-local* ``num_compute_units``
+    binding inside ``topk_topp_triton`` (the global helper is shared by MLA /
+    model_runner and must not change) so the sampler sees
+    ``16 * MULT`` compute units -> up to MULT times more rows in flight.
+    Kernel math is untouched; only the grid shape and scratch buffer
+    ``(NUM_PROGRAMS, vocab)`` grow accordingly.
+
+    Env switch: VLLM_FL_SAMPLER_SM_MULT (default 4; 0 disables).
+    """
+    try:
+        import os
+
+        import vllm.v1.sample.ops.topk_topp_triton as _ttt
+    except Exception as e:
+        logger.warning(
+            "patch_sampler_parallelism_for_iluvatar: topk_topp_triton not found: %s", e
+        )
+        return
+
+    try:
+        mult = int(os.environ.get("VLLM_FL_SAMPLER_SM_MULT", 4))
+    except ValueError:
+        mult = 4
+    if mult <= 1:
+        return  # disabled or no-op
+
+    if getattr(_ttt, "_fl_iluvatar_sampler_patched", False):
+        return  # idempotent
+
+    _orig_ncu = _ttt.num_compute_units
+
+    def _scaled_ncu(device_id: int = 0) -> int:
+        return _orig_ncu(device_id) * mult
+
+    _ttt.num_compute_units = _scaled_ncu
+    _ttt._fl_iluvatar_sampler_patched = True
+    _ttt._fl_iluvatar_orig_ncu = _orig_ncu
+    logger.info(
+        "patch_sampler_parallelism_for_iluvatar: sampler grid x%d "
+        "(env VLLM_FL_SAMPLER_SM_MULT=0 to disable)",
+        mult,
+    )
+
+
+patch_sampler_parallelism_for_iluvatar()
+
+
 def patch_torch_inductor_for_iluvatar() -> None:
     """Patch torch._inductor GPUTarget to use the correct triton backend name.
 
