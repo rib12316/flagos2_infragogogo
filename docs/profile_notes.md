@@ -59,3 +59,9 @@ eager step 时长 334.8ms（正式跑 graph 模式 156ms，差值为图收益）
 
 ### 方法论追加
 - 微基准组间漂移可达 73%（GPU 时钟/缓存状态）——**所有对比必须组内交替 A/B（≥3 轮）**，单组对照会出 1.36× 假加速（本次 tile32 教训）
+
+### KV 布局 HND 实验（2026-11-01 深夜，负结果）
+- 假设：NHD 布局下 KV 读为 256B 连续+512B 跳（头间夹缝），HND（vllm 原生 `VLLM_KV_CACHE_LAYOUT=HND`，stride_order (0,1,3,2,4)）使固定头后 4KB 连续 → attention 读带宽应提升
+- 实测：HND serve 正常（连通性/数学题正确，全链路兼容），但官方 4K 第 2 轮 2327 vs NHD 2562（**-9%**）
+- 解释：decode attention 读收益 < KV 写入（reshape_and_cache_flash 交错写）/prefill 访存/其他 copy kernel 的损失
+- 结论：放弃布局方向；HND env 不引入
