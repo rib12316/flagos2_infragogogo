@@ -1,0 +1,5 @@
+Running[eval]:   0%|          | 0/1 [35:40<?, ?benchmark/s]                                                           2026-11-01 23:44:50 - evalscope - [32mINFO[0m: Aggregating scores for subset: Level 3[0m
+│ Model   │ Dataset   │ Metric     │ Subset   │   Num │ Score   │
+│ minicpm │ MATH-500  │ Accuracy ↑ │ Level 3  │   105 │ 97.1%   │
+│ Model   │ Dataset   │ Metric     │ Subset   │   Num │ Score   │
+│ minicpm │ MATH-500  │ Accuracy ↑ │ Level 3  │   105 │ 97.1%   │

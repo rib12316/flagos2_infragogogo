@@ -594,3 +594,77 @@ class IluvatarBackend(Backend):
         # triton < 3.3.  The kernel itself uses USE_TD=False at runtime, so
         # the stub is never called.
         return AttentionBackendEnum.TRITON_ATTN.get_path()
+
+
+def patch_unified_attention_td_for_iluvatar() -> None:
+    """Enable tensor-descriptor KV loads for long-context decode on Iluvatar.
+
+    vllm's ``unified_attention`` wrapper accepts ``use_td`` (tensor
+    descriptor / TMA-style tile loads for K/V); it is only enabled by
+    default on Intel XPU (``VLLM_TRITON_ATTN_USE_TD`` tri-state env).
+    On BI-V150 with triton 3.6 the descriptor path compiles and runs
+    bit-identically, with a clear win on long KV:
+
+      5-round alternating A/B (decode shapes, GQA 16Q/2KV, bf16, block 16):
+        bs30/kv17000: TD off 1737us -> on 1424us  (1.22x, stable)
+        bs64/kv4600 : TD off 1129us -> on 1090us  (1.04x, with rare
+                                                   ~1.7x slow outliers)
+
+    Hence enable TD only when the batch's max KV length is long
+    (``max_seqlen_k > VLLM_FL_ATTN_TD_KV_THRESHOLD``, default 8192) —
+    a pure host-side integer check on metadata, zero GPU sync. The
+    wrapper itself then handles the Q/O descriptor gating and layout
+    asserts. Kernel output is bit-identical either way.
+
+    Env switches: VLLM_FL_ATTN_TD_KV_THRESHOLD (0 disables the patch).
+    """
+    try:
+        import os
+
+        import vllm.v1.attention.ops.triton_unified_attention as _tua
+    except Exception as e:
+        logger.warning(
+            "patch_unified_attention_td_for_iluvatar: triton_unified_attention not found: %s", e
+        )
+        return
+
+    try:
+        thr = int(os.environ.get("VLLM_FL_ATTN_TD_KV_THRESHOLD", 8192))
+    except ValueError:
+        thr = 8192
+    if thr <= 0:
+        return  # disabled
+
+    if getattr(_tua.unified_attention, "_fl_iluvatar_td", False):
+        return  # idempotent
+
+    _orig_ua = _tua.unified_attention
+
+    def _ua_td(*args, **kwargs):
+        msk = kwargs.get("max_seqlen_k")
+        if msk is not None and not isinstance(msk, torch.Tensor) and msk > thr:
+            kwargs.setdefault("use_td", True)
+        return _orig_ua(*args, **kwargs)
+
+    _ua_td._fl_iluvatar_td = True
+    _ua_td._fl_iluvatar_orig = _orig_ua
+    _tua.unified_attention = _ua_td
+    # triton_attn.py does `from ... import unified_attention` — patch its
+    # module-local reference too.
+    try:
+        import vllm.v1.attention.backends.triton_attn as _ta
+
+        if getattr(_ta.unified_attention, "_fl_iluvatar_td", False) is False:
+            _ta.unified_attention = _ua_td
+    except Exception as e:
+        logger.warning(
+            "patch_unified_attention_td_for_iluvatar: triton_attn rebind skipped: %s", e
+        )
+    logger.info(
+        "patch_unified_attention_td_for_iluvatar: use_td=True when max_seqlen_k > %d "
+        "(env VLLM_FL_ATTN_TD_KV_THRESHOLD=0 to disable)",
+        thr,
+    )
+
+
+patch_unified_attention_td_for_iluvatar()
