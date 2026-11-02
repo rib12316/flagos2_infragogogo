@@ -65,3 +65,11 @@ eager step 时长 334.8ms（正式跑 graph 模式 156ms，差值为图收益）
 - 实测：HND serve 正常（连通性/数学题正确，全链路兼容），但官方 4K 第 2 轮 2327 vs NHD 2562（**-9%**）
 - 解释：decode attention 读收益 < KV 写入（reshape_and_cache_flash 交错写）/prefill 访存/其他 copy kernel 的损失
 - 结论：放弃布局方向；HND env 不引入
+
+### USE_TD 实验（2026-11-02，负结果）
+- 假设：vllm unified kernel 的 tensor-descriptor（TMA 风格）KV load 路径（默认仅 XPU 开）在 iluvatar triton 3.6 可用且长 KV 有收益
+- 微基准（eager）：16K 形状 5 轮中位数 TD off 1737µs → on 1424µs（**1.22× 稳定，bit-exact**）；4K 仅 1.04× 且有慢尾
+- patch：`VLLM_FL_ATTN_TD_KV_THRESHOLD=8192` 动态触发（host int 判断，双模块引用重绑定）
+- **端到端 16K 官方口径：1263.64 vs 1263.35（+0.02%，持平）**——四轮逐轮一致
+- 根因：decode 走 FULL graph，图捕获时 metadata 的 max_seqlen_k 小于阈值 → TD=off 编译进图 → replay 永远 off；prefill（eager）虽触发 TD 但 2D 路径无收益（TTFT 435s 持平）
+- 结论：分支保留不 merge。若未来要启用需让 capture 路径的 max_seqlen_k > 阈值（改 capture metadata 构造，风险/工作量不成比例）
