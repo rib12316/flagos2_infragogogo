@@ -73,3 +73,14 @@ eager step 时长 334.8ms（正式跑 graph 模式 156ms，差值为图收益）
 - **端到端 16K 官方口径：1263.64 vs 1263.35（+0.02%，持平）**——四轮逐轮一致
 - 根因：decode 走 FULL graph，图捕获时 metadata 的 max_seqlen_k 小于阈值 → TD=off 编译进图 → replay 永远 off；prefill（eager）虽触发 TD 但 2D 路径无收益（TTFT 435s 持平）
 - 结论：分支保留不 merge。若未来要启用需让 capture 路径的 max_seqlen_k > 阈值（改 capture metadata 构造，风险/工作量不成比例）
+
+### B1 TD 图内状态终判（2026-11-03，负结果闭环）
+- 补充调研证据（vllm_fl/worker/model_runner.py:2309-2315）：图捕获期 `max_seq_len = max_model_len`（131072）→ 我们的 TD patch 阈值判断（max_seqlen_k>8192）在捕获时应为 True → **TD 理应已编译进 decode 图**
+- 结合端到端 A/B（16K 官方口径 1263.64 vs 1263.35 持平）终判：kernel 级 1.22×（eager 微基准 bs30/kv17000）在真实负载的动态 batch/KV 长度分布下被摊薄，非图捕获问题
+- 4K 侧 TD 仅 1.04× 且有慢尾，无分档价值 → **TD 方向终判负，feat/d3d-td-longkv 归档**
+
+### 量化方向终判（2026-11-02/03，详见 docs/kv_quant_负结果报告.md）
+- int8_per_token_head：图模式精度崩（62-78% vs eager 90.6%，12 实验矩阵，根因在图 replay 集成）
+- fp8_per_token_head：精度无损（93.75%=bf16）但 4K -18% / 16K -26.5%（prefill -25% 压倒 decode +600%）
+- 根因：BI-V150 无量化 KV 硬件加速，读字节减半收益被 scale load + dequant 抵消
+- KV 容量 1.94×（1,014,224 tokens）机制验证成功——硬件不支持
