@@ -594,3 +594,121 @@ class IluvatarBackend(Backend):
         # triton < 3.3.  The kernel itself uses USE_TD=False at runtime, so
         # the stub is never called.
         return AttentionBackendEnum.TRITON_ATTN.get_path()
+
+
+def patch_scale_cache_capture_safe_for_iluvatar() -> None:
+    """Make per-token-head KV scale-cache init capture-safe.
+
+    Bug: upstream ``TritonAttentionImpl._ensure_scale_caches`` lazily builds
+    strided scale views on first forward and calls ``fill_(1.0)``. With
+    FULL_DECODE_ONLY cudagraphs the first forward IS the capture dummy run
+    (the memory-profile run returns early on ``attn_metadata is None``), so
+    the fill gets recorded INSIDE every decode graph. Each replay then wipes
+    ALL historical scales to 1.0 while the quantized write kernel only
+    re-writes the scale of the newly appended token — long-context attention
+    then consumes int8 raw values with scale=1 and collapses (measured:
+    math_500 L3 limit32 drops from 90.6% (eager) to 75% (graph) with
+    short prompts unaffected).
+
+    Fix: drop the fill entirely. A scale slot is only read after the
+    corresponding KV token has been written (the write kernel stores the
+    scale inline), so the uninitialized pad region is never consumed and
+    the fill is redundant — and, inside capture, actively harmful.
+
+    Env switch: VLLM_FL_KV_SCALE_NOFILL=0 restores upstream behaviour.
+    """
+    try:
+        import os
+
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+    except Exception as e:
+        logger.warning(
+            "patch_scale_cache_capture_safe_for_iluvatar: triton_attn not found: %s", e
+        )
+        return
+
+    try:
+        if os.environ.get("VLLM_FL_KV_SCALE_NOFILL", "1") != "1":
+            return  # disabled
+    except Exception:
+        pass
+
+    if getattr(TritonAttentionImpl, "_fl_iluvatar_scale_nofill", False):
+        return  # idempotent
+
+    def _ensure_scale_caches_nofill(self, kv_cache: torch.Tensor) -> None:
+        if self._k_scale_cache is not None:
+            return
+        from vllm.utils.torch_utils import get_dtype_size
+
+        num_blocks, _, block_size, nkv, padded_hs = kv_cache.shape
+        dtype_sz = kv_cache.element_size()
+        scale_pad = get_dtype_size(torch.float32) // dtype_sz  # e.g. 4
+        hs = padded_hs - scale_pad
+
+        raw = kv_cache.untyped_storage()
+        base_f32 = torch.tensor([], dtype=torch.float32, device=kv_cache.device).set_(
+            raw
+        )
+
+        kv_half_bytes = block_size * nkv * padded_hs * dtype_sz
+        full_block_f32 = 2 * kv_half_bytes // 4
+        slot_f32 = nkv * padded_hs * dtype_sz // 4
+        head_f32 = padded_hs * dtype_sz // 4
+        scale_off_f32 = hs * dtype_sz // 4
+
+        # K scales: kv_half=0 (NO fill — see docstring; fill_ inside a captured
+        # decode graph wipes all historical scales on every replay)
+        self._k_scale_cache = torch.as_strided(
+            base_f32,
+            size=(num_blocks, block_size, nkv),
+            stride=(full_block_f32, slot_f32, head_f32),
+            storage_offset=scale_off_f32,
+        )
+
+        v_base_f32 = kv_half_bytes // 4
+        self._v_scale_cache = torch.as_strided(
+            base_f32,
+            size=(num_blocks, block_size, nkv),
+            stride=(full_block_f32, slot_f32, head_f32),
+            storage_offset=v_base_f32 + scale_off_f32,
+        )
+
+    TritonAttentionImpl._ensure_scale_caches = _ensure_scale_caches_nofill
+    TritonAttentionImpl._fl_iluvatar_scale_nofill = True
+    logger.info(
+        "patch_scale_cache_capture_safe_for_iluvatar: scale-cache fill_(1.0) "
+        "removed (capture-safe; env VLLM_FL_KV_SCALE_NOFILL=0 to restore upstream)"
+    )
+
+
+patch_scale_cache_capture_safe_for_iluvatar()
+
+
+def patch_force_2d_decode_for_iluvatar() -> None:
+    """DEBUG-ONLY experiment: force decode attention onto the 2D path by
+    zeroing seq_threshold_3D (use_3d requires num_seqs <= seq_threshold_3D).
+    Used to bisect the int8 per-token-head graph-mode accuracy regression:
+    eager(3D)=90.6% vs graph(3D)=75-78%. If graph(2D) recovers, the bug is
+    in the 3D split path combined with per-token-head scales.
+    Enable with VLLM_FL_FORCE_2D_DECODE=1."""
+    try:
+        import os
+
+        from vllm.v1.attention.backends import triton_attn as _ta
+    except Exception as e:
+        logger.warning("patch_force_2d_decode_for_iluvatar: %s", e)
+        return
+    if os.environ.get("VLLM_FL_FORCE_2D_DECODE", "0") != "1":
+        return
+    _orig_init = _ta.TritonAttentionMetadataBuilder.__init__
+
+    def _init_2d(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        self.seq_threshold_3D = 0  # num_seqs > 0 always -> use_3d False
+
+    _ta.TritonAttentionMetadataBuilder.__init__ = _init_2d
+    logger.info("patch_force_2d_decode_for_iluvatar: seq_threshold_3D=0 (2D decode)")
+
+
+patch_force_2d_decode_for_iluvatar()
